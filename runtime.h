@@ -7,6 +7,12 @@
 
 #include "ast.h"
 
+#include "gc.h"
+
+#define HEAP_OBJECTS(O) \
+  O(Value)              \
+  O(Environment)
+
 struct Value;
 
 struct CharacterVector {
@@ -68,7 +74,7 @@ struct Binding {
     Value * value;
 };
 
-struct Environment {
+struct Environment : public HeapObject<Environment> {
     Environment * parent;
     Binding * bindings;
     int size;
@@ -141,7 +147,7 @@ struct Function {
 
 };
 
-struct Value {
+struct Value : public HeapObject<Value> {
     enum class Type {
         Double,
         Character,
