@@ -7,6 +7,8 @@
 
 #include "ast.h"
 
+#include "gc_cpp.h"
+
 struct Value;
 
 struct CharacterVector {
@@ -63,12 +65,12 @@ struct DoubleVector {
 };
 
 
-struct Binding {
+struct Binding : public gc {
     int symbol;
     Value * value;
 };
 
-struct Environment {
+struct Environment : public gc {
     Environment * parent;
     Binding * bindings;
     int size;
@@ -141,7 +143,7 @@ struct Function {
 
 };
 
-struct Value {
+struct Value : public gc {
     enum class Type {
         Double,
         Character,
