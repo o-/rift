@@ -14,9 +14,6 @@
 
 namespace gc {
 
-// We keep a mark byte for every object
-enum class Mark : uint8_t { UNUSED = 0xaa, WHITE = 0x77, BLACK = 0xbb };
-
 typedef size_t index_t;
 
 // NodeIndex is a container to pass around the location of an object on the 
@@ -45,7 +42,9 @@ template <typename T>
 class Page {
   public:
     // Node is the memory allocated to hold one T
-    struct Node { uint8_t data[sizeof(T)]; };
+    struct Node {
+        uint8_t data[sizeof(T)];
+    };
     static_assert(sizeof(Node) == sizeof(T), "");
 
     static constexpr size_t nodeSize = sizeof(Node);
@@ -56,7 +55,7 @@ class Page {
     // 1. Within the page boundaries
     // 2. Pointing to the beginning of a Node cell
     // 3. Pointing to a node cell which is not unused
-    bool isValidObj(void* ptr) {
+    bool isValidObj(void* ptr) const {
         auto addr = reinterpret_cast<uintptr_t>(ptr);
 
         if (addr < first || addr > last)
@@ -65,76 +64,76 @@ class Page {
         auto idx = getClosestIndex(addr);
 
         return reinterpret_cast<uintptr_t>(&node[idx]) == addr &&
-               mark[idx] != Mark::UNUSED;
+            isAlloc[idx];
     }
 
-    index_t getIndex(void* ptr) {
-        assert(isValidObj(ptr));
+    index_t getIndex(void* ptr) const {
         auto addr = reinterpret_cast<uintptr_t>(ptr);
         return getClosestIndex(addr);
     }
 
     T* alloc() {
-        if (freelist.size()) {
-            auto idx = freelist.front();
-            freelist.pop_front();
-
-            assert(mark[idx] == Mark::UNUSED);
-            mark[idx] = Mark::WHITE;
-
-            return getAt(idx);
+        // Lazy sweep to find the next unmarked Node
+        sweep();
+        if (sweepIdx < pageSize) {
+            assert(!isAlloc[sweepIdx]);
+            isAlloc[sweepIdx] = true;
+            T* res = reinterpret_cast<T*>(&node[sweepIdx]);
+            sweepIdx++;
+            return res;
         }
         return nullptr;
     }
 
     Page() : first(reinterpret_cast<uintptr_t>(&node[0])),
-             last(reinterpret_cast<uintptr_t>(&node[pageSize - 1])) {
+             last(reinterpret_cast<uintptr_t>(&node[pageSize - 1])),
+             sweepIdx(0) {
         assert(getClosestIndex((uintptr_t)first + 1) == 0);
         assert(getClosestIndex((uintptr_t)last + 1) == pageSize - 1);
 
-        mark.fill(Mark::UNUSED);
-        for (index_t i = 0; i < pageSize; ++i)
-            freelist.push_back(i);
+        mark.fill(false);
+        isAlloc.fill(false);
     }
 
-    void sweep() {
+    ~Page() {
         for (index_t i = 0; i < pageSize; ++i) {
-            switch (mark[i]) {
-                case Mark::WHITE:
-                    free(i);
-                    break;
-                case Mark::BLACK:
-                    mark[i] = Mark::WHITE;
-                    break;
-                case Mark::UNUSED:
-                    break;
-            }
+            if (isAlloc[i])
+                free(i);
         }
     }
 
-    index_t free() const {
-        return freelist.size() * nodeSize;
+    void sweep() {
+        while (sweepIdx < pageSize) {
+            if (!mark[sweepIdx]) {
+                if (isAlloc[sweepIdx]) {
+                    free(sweepIdx);
+                }
+                return;
+            }
+            mark[sweepIdx] = false;
+            sweepIdx++;
+        }
+    }
+
+    void clearMark() {
+        if (sweepIdx < pageSize)
+            mark.fill(false);
+        sweepIdx = 0;
     }
 
     void verify() const {
-        for (auto i : freelist)
-            assert(mark[i] == Mark::UNUSED);
-
-        for (auto m : mark)
-            assert(m == Mark::UNUSED || m == Mark::WHITE ||
-                   m == Mark::BLACK);
-    }
-
-    bool empty() const {
-        return freelist.size() == pageSize;
+        for (index_t i = 0; i < pageSize; ++i) {
+            assert(isAlloc[i] || !mark[i]);
+        }
     }
 
     void setMark(index_t idx) {
-        assert(mark[idx] == Mark::WHITE);
-        mark[idx] = Mark::BLACK;
+        assert(isAlloc[idx]);
+        assert(!mark[idx]);
+        mark[idx] = true;
     }
 
-    const Mark & getMark(index_t idx) {
+    bool isMarked(index_t idx) const {
         return mark[idx];
     }
 
@@ -144,6 +143,8 @@ class Page {
     const uintptr_t first, last;
 
   private:
+    index_t sweepIdx;
+
     // Freeing a node will
     // 1. call the destructor of said object
     // 2. push the cell to the freelist
@@ -152,23 +153,22 @@ class Page {
 #ifdef GC_DEBUG
         memset(&node[idx], 0xd, nodeSize);
 #endif
-        mark[idx] = Mark::UNUSED;
-        freelist.push_back(idx);
+        isAlloc[idx] = false;
     }
 
     T* getAt(index_t idx) {
         return reinterpret_cast<T*>(&node[idx]);
     }
 
-    index_t getClosestIndex(uintptr_t addr) {
+    index_t getClosestIndex(uintptr_t addr) const {
         uintptr_t start = reinterpret_cast<uintptr_t>(&node);
         // Integer division -> floor
         return (addr - start) / nodeSize;
     }
 
     std::array<Node, pageSize> node;
-    std::array<Mark, pageSize> mark;
-    std::deque<index_t> freelist;
+    std::array<bool, pageSize> mark;
+    std::array<bool, pageSize> isAlloc;
 };
 
 // Arena implements the arena interface plus the alloc()
@@ -178,17 +178,20 @@ class Arena {
   public:
     static constexpr size_t nodeSize = Page<T>::nodeSize;
 
-    T* alloc() {
+    T* alloc(bool grow) {
         for (auto p : page) {
             auto res = p->alloc();
             if (res) return res;
         }
+        if (page.size() > 0 && !grow) return nullptr;
         if (page.size() == NodeIndex::MaxPage) {
             throw std::bad_alloc();
         }
         auto p = new Page<T>;
         registerPage(p);
-        return p->alloc();
+        auto n = p->alloc();
+        assert(n);
+        return n;
     }
 
     NodeIndex findNode(void* ptr) {
@@ -208,25 +211,10 @@ class Arena {
         return NodeIndex::nodeNotFound();
     }
 
-    void sweep() {
-        for (auto pi = page.begin(); pi != page.end(); ) {
-            auto p = *pi;
-            p->sweep();
-            // If a page is completely empty we release it
-            if (p->empty()) {
-                delete p;
-                pi = page.erase(pi);
-            } else {
-                pi++;
-            }
+    void clearMark() {
+        for (auto p: page) {
+            p->clearMark();
         }
-    }
-
-    size_t free() const {
-        size_t f = 0;
-        for (auto p : page)
-            f += p->free();
-        return f;
     }
 
     size_t size() const {
@@ -238,8 +226,8 @@ class Arena {
             p->verify();
     }
 
-    const Mark & getMark(NodeIndex & i) const {
-        return page[i.pageNum]->getMark(i.idx);
+    bool isMarked(NodeIndex & i) const {
+        return page[i.pageNum]->isMarked(i.idx);
     }
 
     void setMark(NodeIndex & i) {
@@ -277,7 +265,6 @@ class GarbageCollector {
   public:
     constexpr static size_t INITIAL_HEAP_SIZE = 4096;
     constexpr static double GC_GROW_RATE = 1.3f;
-    constexpr static double GC_TRIGGER = 0.9f;
 
     // Interface to request memory from the GC
     template <typename T>
@@ -310,14 +297,12 @@ class GarbageCollector {
   private:
     template <typename T>
     void* doAlloc() {
-        // If we hit max heap size trigger a GC
-        if (oom<T>())
+        auto res = arena<T>().alloc(false);
+        if (!res) {
             doGc();
-
-        if (oom<T>())
-            heapLimit = (double)heapLimit * GC_GROW_RATE;
-
-        auto res = arena<T>().alloc();
+            res = arena<T>().alloc(false);
+            if (!res) res = arena<T>().alloc(true);
+        }
 
         assert(maybePointer(res));
 
@@ -345,15 +330,6 @@ class GarbageCollector {
     size_t heapLimit;
 
     size_t size() const;
-    size_t free() const;
-
-    // Out of memory?
-    template <typename T>
-    bool oom() const {
-        size_t required = sizeof(T);
-        return (float)(arena<T>().size() - arena<T>().free() + required) /
-               (float)heapLimit > GC_TRIGGER;
-    }
 
     void scanStack() {
         // Clobber all registers:
@@ -394,7 +370,14 @@ class GarbageCollector {
     // The core mark & sweep algorithm
     void doGc() {
 #ifdef GC_DEBUG
-        unsigned memUsage = size() - free();
+        verify();
+#endif
+
+        // Since we sweep lazily we need to make sure to reset the mark bits of
+        // all the nodes we did not yet sweep.
+        clearMark();
+
+#ifdef GC_DEBUG
         verify();
 #endif
 
@@ -402,17 +385,9 @@ class GarbageCollector {
 
 #ifdef GC_DEBUG
         verify();
-#endif
-
-        sweep();
-
-#ifdef GC_DEBUG
-        verify();
-        unsigned memUsage2 = size() - free();
-        assert(memUsage2 <= memUsage);
-        std::cout << "reclaiming " << memUsage - memUsage2
-                  << ". Heap limit " << heapLimit << "b, "
-                  << "used " << memUsage2 << "b, total " << size() << "b\n";
+        std::cout << "gc: "
+                  << "Heap limit " << heapLimit << "b, "
+                  << "total " << size() << "b\n";
 #endif
     }
 
@@ -436,14 +411,13 @@ class GarbageCollector {
     template <typename T>
     void mark(T * obj, NodeIndex & i) {
         auto & a = arena<T>();
-        if (a.getMark(i) == Mark::WHITE) {
+        if (!a.isMarked(i)) {
             a.setMark(i);
             markImpl<T>(obj);
         }
     }
 
-    // Delete everything which is not reachable anymore
-    void sweep();
+    void clearMark();
 
     void verify() const;
 
