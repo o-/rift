@@ -16,62 +16,45 @@
 
 #include "rval.h"
 
-// #define GC_DEBUG 1
-
-void gc_scanStack();
+#define GC_DEBUG 1
 
 namespace gc {
 
 typedef size_t index_t;
 
-// NodeIndex is a container to pass around the location of an object on the 
-// heap. Location is given by page index and object index (relative to page).
-struct NodeIndex {
-public:
-    static constexpr index_t MaxPage = 0xffffffff;
-
-    NodeIndex(index_t pageNum, index_t idx) : pageNum(pageNum), idx(idx) {}
-    const index_t pageNum;
-    const index_t idx;
-
-    static const NodeIndex & nodeNotFound() {
-        static NodeIndex nodeNotFound(MaxPage, 0);
-        return nodeNotFound;
-    }
-
-    bool found() const {
-        return pageNum != MaxPage;
-    }
-};
-
 class Page {
 public:
-    static constexpr size_t nodeSize = 32;
+    static constexpr size_t blockSize = 32;
 
-    struct Node {
-        uint8_t data[nodeSize];
+    struct Block {
+        uint8_t data[blockSize];
     };
     struct Free {
-        uint8_t nodes;
+#ifdef GC_DEBUG
+        void* canary[2];
+        static constexpr void* CANARY = (void*)0xafafafaf;
+#endif
+        uint8_t blocks;
         Free* next;
     };
-    static_assert(sizeof(Node) == nodeSize, "");
-    static_assert(sizeof(Node) >= sizeof(Free), "");
+    static_assert(sizeof(Block) == blockSize, "");
+    static_assert(sizeof(Block) >= sizeof(Free), "");
+    static_assert(sizeof(Block) >= sizeof(RVal), "");
 
-    static constexpr index_t pageSize = 3600 / nodeSize;
-    static constexpr size_t size = pageSize * nodeSize;
+    static constexpr index_t pageSize = 3600 / blockSize;
+    static constexpr size_t size = pageSize * blockSize;
 
     static_assert(pageSize <= 256, "");
 
-    size_t size2nodes(size_t size) {
-        if (size % nodeSize == 0)
-            return size / nodeSize;
-        return 1 + (size / nodeSize);
+    size_t size2blocks(size_t size) {
+        if (size % blockSize == 0)
+            return size / blockSize;
+        return 1 + (size / blockSize);
     }
 
     // A valid object is:
     // 1. Within the page boundaries
-    // 2. Pointing to the beginning of a Node cell
+    // 2. Pointing to the beginning of a block
     // 3. Pointing to a node cell which is not unused
     bool isValidObj(void* ptr) const {
         auto addr = reinterpret_cast<uintptr_t>(ptr);
@@ -81,7 +64,7 @@ public:
 
         auto idx = getClosestIndex(addr);
 
-        return reinterpret_cast<uintptr_t>(&node[idx]) == addr && objSize[idx];
+        return reinterpret_cast<uintptr_t>(&block[idx]) == addr && objSize[idx];
     }
 
     index_t getIndex(void* ptr) const {
@@ -89,31 +72,38 @@ public:
         return getClosestIndex(addr);
     }
 
-    void* alloc(size_t size) {
-        size_t needed = size2nodes(size);
+    RVal* alloc(size_t size) {
+        size_t needed = size2blocks(size);
 
         Free* prev = &freelist;
         Free* cur = freelist.next;
 
         while (cur) {
-            if (cur->nodes >= needed) {
+            if (cur->blocks >= needed) {
                 auto idx = getIndex(cur);
 
-                if (cur->nodes > needed) {
+#ifdef GC_DEBUG
+                assert(cur->canary[0] == Free::CANARY);
+                assert(cur->canary[1] == Free::CANARY);
+#endif
+                if (cur->blocks > needed) {
                     Free* next = (Free*)getAt(idx+needed);
-                    next->nodes = cur->nodes - needed;
+                    next->blocks = cur->blocks - needed;
                     next->next = cur->next;
                     prev->next = next;
-                    freeSpace -= nodeSize * needed;
+                    freeSpace -= blockSize * needed;
                 } else {
                     prev->next = cur->next;
-                    freeSpace -= nodeSize * cur->nodes;
+                    freeSpace -= blockSize * cur->blocks;
                 }
 
-                assert(!objSize[idx] && !mark[idx]);
+                assert(!objSize[idx]);
                 objSize[idx] = needed;
 
-                return cur;
+                RVal* obj = getAt(idx);
+                obj->mark = 0;
+
+                return obj;
             }
             prev = cur;
             cur = cur->next;
@@ -121,31 +111,36 @@ public:
         return nullptr;
     }
 
-    Page() : first(reinterpret_cast<uintptr_t>(&node[0])),
-             last(reinterpret_cast<uintptr_t>(&node[pageSize - 1])) {
+    Page() : first(reinterpret_cast<uintptr_t>(&block[0])),
+             last(reinterpret_cast<uintptr_t>(&block[pageSize - 1])) {
         assert(getClosestIndex((uintptr_t)first + 1) == 0);
         assert(getClosestIndex((uintptr_t)last + 1) == pageSize - 1);
 
-        mark.fill(false);
         objSize.fill(0);
 
         Free* first = (Free*)getAt(0);
         first->next = nullptr;
-        first->nodes = pageSize;
+        first->blocks = pageSize;
         freelist.next = first;
-        freelist.nodes = 0;
+        freelist.blocks = 0;
 
-        freeSpace = pageSize * nodeSize;
+#ifdef GC_DEBUG
+        first->canary[0] = Free::CANARY;
+        first->canary[1] = Free::CANARY;
+#endif
+
+        freeSpace = pageSize * blockSize;
     }
 
     void sweep() {
-        for (index_t i = 0; i < pageSize; ++i) {
-            if (!mark[i]) {
-                if (objSize[i]) {
-                    freeNode(i);
-                }
+        index_t i = 0;
+        while (i < pageSize) {
+            if (objSize[i]) {
+                if (!getAt(i)->mark)
+                    freeBlock(i);
+                i += objSize[i];
             } else {
-                mark[i] = false;
+                ++i;
             }
         }
     }
@@ -154,36 +149,28 @@ public:
         return freeSpace;
     }
 
-    void verify() const {
+    void verify() {
         size_t foundFree = 0;
         Free* f = freelist.next;
         while (f) {
             auto i __attribute__((unused)) = getIndex(f);
-            assert(!mark[i] && !objSize[i]);
-            foundFree += f->nodes * nodeSize;
+            assert(!objSize[i]);
+            foundFree += f->blocks * blockSize;
             f = f->next;
         }
         assert(foundFree == freeSpace);
 
         for (index_t i = 0; i < pageSize; ++i) {
-            assert(objSize[i] || !mark[i]);
+            if (objSize[i]) {
+                RVal o = getAt(i);
+                assert(o->mark == 0 || o->mark == 1);
+                assert(o->type > Type::Invalid && o->type < Type::End);
+            }
         }
     }
 
     bool empty() const {
         return freeSpace == pageSize;
-    }
-
-    void setMark(index_t idx) {
-        assert(idx < pageSize);
-        assert(objSize[idx]);
-        assert(!mark[idx]);
-        mark[idx] = true;
-    }
-
-    bool isMarked(index_t idx) const {
-        assert(idx < pageSize);
-        return mark[idx];
     }
 
     Page(Page const &) = delete;
@@ -193,50 +180,60 @@ public:
 
 private:
     // Freeing an object
-    void freeNode(index_t idx) {
+    void freeBlock(index_t idx) {
         // TODO destructor??
  
+        size_t freed = objSize[idx] * blockSize;
+
 #ifdef GC_DEBUG
-        memset(&node[idx], 0xd, nodeSize);
+        RVal* old = getAt(idx);
+        assert(old->mark == 0);
+        memset(old, 0xd, freed);
 #endif
 
-        freeSpace += objSize[idx] * nodeSize;
+        freeSpace += freed;
 
         Free* f = (Free*)getAt(idx);
         f->next = freelist.next;
-        f->nodes = objSize[idx];
+        f->blocks = objSize[idx];
         freelist.next = f;
         objSize[idx] = 0;
+
+#ifdef GC_DEBUG
+        f->canary[0] = Free::CANARY;
+        f->canary[1] = Free::CANARY;
+#endif
     }
 
-    void* getAt(index_t idx) {
-        return &node[idx];
+    RVal* getAt(index_t idx) {
+        return reinterpret_cast<RVal*>(&block[idx]);
     }
 
     index_t getClosestIndex(uintptr_t addr) const {
-        uintptr_t start = reinterpret_cast<uintptr_t>(&node);
+        uintptr_t start = reinterpret_cast<uintptr_t>(&block);
         // Integer division -> floor
         return (addr - start) / nodeSize;
     }
 
-    std::array<Node, pageSize> node;
-    std::array<bool, pageSize> mark;
+    // The memory for objects is partitinoned in addressable blocks
+    std::array<Block, pageSize> block;
+    // The index of the first block of an object is used to store the obj size
+    // in blocks
     std::array<uint8_t, pageSize> objSize;
+    // The freelist is internal. We just cast &block[] to Free* to create a
+    // linked list of free blocks.
     Free freelist;
     size_t freeSpace;
 };
 
 class Arena {
 public:
-    void* alloc(size_t sz, bool grow) {
+    RVal* alloc(size_t sz, bool grow) {
         for (auto p : page) {
             auto res = p->alloc(sz);
             if (res) return res;
         }
         if (page.size() > 0 && !grow) return nullptr;
-        if (page.size() == NodeIndex::MaxPage) {
-            throw std::bad_alloc();
-        }
         auto p = new Page();
         registerPage(p);
         auto n = p->alloc(sz);
@@ -244,22 +241,22 @@ public:
         return n;
     }
 
-    NodeIndex findNode(void* ptr) {
+    RVal* find(void* ptr) {
         uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
 
         assert(minAddr < maxAddr);
 
         // quickly discard implausible pointers
         if (addr < minAddr || addr > maxAddr)
-            return NodeIndex::nodeNotFound();
+            return nullptr;
 
         for (index_t i = 0; i < page.size(); i++) {
             if (page[i]->isValidObj(ptr)) {
-                return NodeIndex(i, page[i]->getIndex(ptr));
+                return (RVal*)ptr;
             }
         }
 
-        return NodeIndex::nodeNotFound();
+        return nullptr;
     }
 
     void sweep() {
@@ -291,25 +288,6 @@ public:
         for (auto p : page)
             p->verify();
     }
-
-    bool isMarked(NodeIndex & i) const {
-        return page[i.pageNum]->isMarked(i.idx);
-    }
-
-    void setMark(NodeIndex & i) {
-        page[i.pageNum]->setMark(i.idx);
-    }
-
-    void mark(void* ptr) {
-        for (index_t i = 0; i < page.size(); i++) {
-            if (page[i]->isValidObj(ptr)) {
-                page[i]->setMark(page[i]->getIndex(ptr));
-                return;
-            }
-        }
-        assert(false);
-    }
-
 
     Arena() : minAddr(-1), maxAddr(0) {}
 
@@ -352,16 +330,15 @@ private:
     Arena arena;
 
     RVal* doAlloc(size_t sz, Type type) {
-        void* res = arena.alloc(sz, false);
+        RVal* res = arena.alloc(sz, false);
         if (!res) {
             doGc();
             res = arena.alloc(sz, false);
             if (!res) res = arena.alloc(sz, true);
         }
         assert(res);
-        RVal* rval = (RVal*)res;
-        rval->type = type;
-        return rval;
+        res->type = type;
+        return res;
     };
 
     size_t size() const {
@@ -372,65 +349,25 @@ private:
         return arena.free();
     }
 
-    void scanStack() {
-        // Clobber all registers:
-        // -> forces all variables currently hold in registers to be spilled
-        //    to the stack where our stackScan can find them.
-        __asm__ __volatile__("nop" : :
-            : "%rax", "%rbx", "%rcx", "%rdx", "%rsi", "%rdi",
-            "%r8", "%r9", "%r10", "%r11", "%r12",
-            "%r13", "%r14", "%r15");
-        gc_scanStack();
-    }
-
     const void * BOTTOM_OF_STACK;
 
-    void mark() {
-        // TODO: maybe some mechanism to define static roots?
-        scanStack();
-    }
+    void scanStackWrapper();
+    void scanStack();
+    void mark();
 
-    // The core mark & sweep algorithm
-    void doGc() {
-#ifdef GC_DEBUG
-        unsigned memUsage = size() - free();
-        verify();
-#endif
-
-        mark();
-
-#ifdef GC_DEBUG
-        verify();
-#endif
-
-        sweep();
-
-#ifdef GC_DEBUG
-        verify();
-        unsigned memUsage2 = size() - free();
-        assert(memUsage2 <= memUsage);
-        std::cout << "reclaiming " << memUsage - memUsage2
-        << "b, used " << memUsage2 << "b, total " << size() << "b\n";
-#endif
-    }
-
-    void mark(NodeIndex& i, RVal* val) {
-        assert(i.found());
-        if (!arena.isMarked(i)) {
-            arena.setMark(i);
-            visitChildren(val);
-        }
-    }
+    void doGc();
 
     void markMaybe(void * ptr) {
-        auto i = arena.findNode(ptr);
-        if (i.found())
-            mark(i, (RVal*)ptr);
+        RVal* res;
+        if ((res = arena.find(ptr)))
+            mark(res);
     }
 
     void mark(RVal* val) {
-        auto i = arena.findNode(val);
-        mark(i, val);
+        if (val->mark)
+            return;
+        val->mark = 1;
+        visitChildren(val);
     }
 
     void visitChildren(RVal*);
@@ -460,8 +397,6 @@ private:
 
     GarbageCollector(GarbageCollector const &) = delete;
     void operator=(GarbageCollector const &) = delete;
-
-    friend void ::gc_scanStack();
 };
 
 } // namespace gc

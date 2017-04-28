@@ -1,20 +1,6 @@
 #include "gc.h"
 #include "runtime.h"
 
-// The stack scan traverses the memory of the C stack and looks at every
-// possible stack slot. If we find a valid heap pointer we mark the
-// object as well as all objects reachable through it as live.
-void __attribute__((noinline)) gc_scanStack() {
-    void ** p = (void**)__builtin_frame_address(0);
-    gc::GarbageCollector & inst = gc::GarbageCollector::inst();
-
-    while (p < inst.BOTTOM_OF_STACK) {
-        if ((uintptr_t)p > 1024)
-            inst.markMaybe(*p);
-        p++;
-    }
-}
-
 namespace gc {
 
 void GarbageCollector::visitChildren(RVal* val) {
@@ -56,5 +42,60 @@ void GarbageCollector::visitChildren(RVal* val) {
             assert(false && "Broken RVal");
     }
 }
+
+// The core mark & sweep algorithm
+void GarbageCollector::doGc() {
+#ifdef GC_DEBUG
+    unsigned memUsage = size() - free();
+    verify();
+#endif
+
+    mark();
+
+#ifdef GC_DEBUG
+    verify();
+#endif
+
+    sweep();
+
+#ifdef GC_DEBUG
+    verify();
+    unsigned memUsage2 = size() - free();
+    assert(memUsage2 <= memUsage);
+    std::cout << "reclaiming " << memUsage - memUsage2
+    << "b, used " << memUsage2 << "b, total " << size() << "b\n";
+#endif
+}
+
+void GarbageCollector::scanStackWrapper() {
+    // Clobber all registers:
+    // -> forces all variables currently hold in registers to be spilled
+    //    to the stack where our stackScan can find them.
+    __asm__ __volatile__("nop" : :
+        : "%rax", "%rbx", "%rcx", "%rdx", "%rsi", "%rdi",
+        "%r8", "%r9", "%r10", "%r11", "%r12",
+        "%r13", "%r14", "%r15");
+    scanStack();
+}
+
+// The stack scan traverses the memory of the C stack and looks at every
+// possible stack slot. If we find a valid heap pointer we mark the
+// object as well as all objects reachable through it as live.
+void __attribute__((noinline)) GarbageCollector::scanStack() {
+    void ** p = (void**)__builtin_frame_address(0);
+
+    while (p < BOTTOM_OF_STACK) {
+        if ((uintptr_t)p > 1024)
+            markMaybe(*p);
+        p++;
+    }
+}
+
+
+void GarbageCollector::mark() {
+    // TODO: maybe some mechanism to define static roots?
+    scanStack();
+}
+
 
 }
